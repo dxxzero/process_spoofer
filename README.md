@@ -1,5 +1,9 @@
 # process_spoofer
-This example code performs PPID as well as commandline argument spoofing.
+This example code performs following techniques:
+*) PPID spoofing
+*) Argument spoofing
+*) Process Mitigation Policy
+*) Process Hollowing / RunPE
 
 # Build 
 ```
