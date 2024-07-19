@@ -1,14 +1,20 @@
+#![windows_subsystem = "windows"]
+
+use std::fs::File;
+
 use process_spoofer::{spoof_arguments, spoof_ppid, apply_process_mitigation_policy, process_hollowing, get_current_filename};
 use windows::{core::s, Win32::{Foundation::HWND, UI::WindowsAndMessaging::{MessageBoxA, MESSAGEBOX_STYLE}}};
+use std::io::prelude::*;
 
 fn main() {
     let filename = get_current_filename();
-    if filename.contains("cmd.exe") {
-        unsafe { MessageBoxA(HWND::default(), s!("Text"),s!("Title"), MESSAGEBOX_STYLE(0x00000040)) };
+    if filename.contains("msedge.exe") {
+        let mut file = File::create("C:\\temp\\foo.txt").expect("Could not create file");
+        _ = file.write_all(b"Hello, world!");
         return
     }
-    spoof_arguments();
-    spoof_ppid(5868);
-    apply_process_mitigation_policy();
+    //spoof_arguments();
+    //spoof_ppid(6556);
+    //apply_process_mitigation_policy();
     process_hollowing(filename);
 }
